@@ -1,20 +1,15 @@
 """
-SmartFarm IoT — Cloud Backend
-Flask + MySQL (Railway) + ML Model (scikit-learn)
-Deploy target: Render.com
-
-Environment variables required (set in Render dashboard):
-  DB_HOST      — Railway MySQL host
-  DB_USER      — Railway MySQL user
-  DB_PASSWORD  — Railway MySQL password
-  DB_NAME      — Railway MySQL database name
-  PORT         — auto-set by Render (don't touch)
+SmartFarm IoT v2.0 — Cloud Backend
+Flask + MySQL (Railway) + Auto-retraining ML
+Sensors  : DHT22, LDR, Soil Moisture, Ultrasonic
+Relays   : Pump1, Feeder, Pump2, Light
 """
 
 import os
 import io
 import csv
 import logging
+import threading
 from datetime import datetime
 
 import pandas as pd
@@ -23,61 +18,70 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import mysql.connector
 from mysql.connector import Error as MySQLError
+from sklearn.ensemble import RandomForestClassifier
 
-# ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger(__name__)
 
-# ── App ───────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 
-# ── ML Model ──────────────────────────────────────────────────
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "smartfarm_model.pkl")
+# ── Constants ─────────────────────────────────────────────────
+MODEL_PATH    = os.path.join(os.path.dirname(__file__), "smartfarm_model.pkl")
+RETRAIN_EVERY = 50
+
+# ── Automation thresholds — must match ESP32 sketch ───────────
+ULTRASONIC_LOW_CM  = 10.0   # below 10cm  → Pump1 ON
+SOIL_DRY_THRESHOLD = 2500   # above 2500  → Pump2 ON
+LDR_DARK_THRESHOLD = 1500   # below 1500  → Light ON
+
+# ── Model state ───────────────────────────────────────────────
+model_state = {
+    "model":          None,
+    "trained_on":     0,
+    "last_retrained": None,
+    "lock":           threading.Lock()
+}
 
 try:
-    model = joblib.load(MODEL_PATH)
+    model_state["model"] = joblib.load(MODEL_PATH)
     log.info("ML model loaded from %s", MODEL_PATH)
 except FileNotFoundError:
-    model = None
-    log.warning("smartfarm_model.pkl not found — /predict and /upload will return error until model is added")
+    log.warning("No model found — rule-based fallback active")
 
 # ── Database ──────────────────────────────────────────────────
 def get_db():
-    """
-    Open a MySQL connection using environment variables.
-    Raises a clear error if any variable is missing.
-    """
     required = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"]
     missing  = [k for k in required if not os.environ.get(k)]
     if missing:
-        raise RuntimeError(f"Missing environment variables: {missing}")
-
+        raise RuntimeError(f"Missing env variables: {missing}")
     return mysql.connector.connect(
-        host     = os.environ["DB_HOST"],
-        user     = os.environ["DB_USER"],
-        password = os.environ["DB_PASSWORD"],
-        database = os.environ["DB_NAME"],
-        port     = int(os.environ.get("DB_PORT", 3306)),
+        host               = os.environ["DB_HOST"],
+        user               = os.environ["DB_USER"],
+        password           = os.environ["DB_PASSWORD"],
+        database           = os.environ["DB_NAME"],
+        port               = int(os.environ.get("DB_PORT", 3306)),
         connection_timeout = 10
     )
 
 def init_db():
-    """
-    Create the sensor_data table if it does not exist.
-    Called once at startup.
-    """
+    """Create table with all sensor and relay columns."""
     sql = """
         CREATE TABLE IF NOT EXISTS sensor_data (
-            id           INT AUTO_INCREMENT PRIMARY KEY,
-            timestamp    DATETIME DEFAULT CURRENT_TIMESTAMP,
-            temperature  FLOAT   NOT NULL,
-            humidity     FLOAT   NOT NULL,
-            ldr_value    INT     NOT NULL,
-            light_status TINYINT NOT NULL DEFAULT 0
+            id            INT AUTO_INCREMENT PRIMARY KEY,
+            timestamp     DATETIME   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            temperature   FLOAT      NOT NULL,
+            humidity      FLOAT      NOT NULL,
+            ldr_value     INT        NOT NULL,
+            soil_moisture INT        NOT NULL DEFAULT 0,
+            distance      FLOAT      NOT NULL DEFAULT 0,
+            relay1_pump1  TINYINT(1) NOT NULL DEFAULT 0,
+            relay2_feeder TINYINT(1) NOT NULL DEFAULT 0,
+            relay3_pump2  TINYINT(1) NOT NULL DEFAULT 0,
+            relay4_light  TINYINT(1) NOT NULL DEFAULT 0
         )
     """
     try:
@@ -90,168 +94,323 @@ def init_db():
     except Exception as e:
         log.error("Database init failed: %s", e)
 
-# ── ML helper ─────────────────────────────────────────────────
-def predict_light(temperature: float, humidity: float, ldr_value: int) -> int:
+# ── Rule-based automation ─────────────────────────────────────
+def apply_rules(ldr: int, soil: int, distance: float) -> dict:
     """
-    Run ML model prediction.
-    Falls back to rule-based logic if model is not loaded.
+    Derive relay states from sensor values.
+    relay2 (feeder) is time-based — handled by ESP32 directly.
+    Backend just records what ESP32 reported.
     """
-    if model is not None:
+    return {
+        "relay1": 1 if (distance > 0 and distance < ULTRASONIC_LOW_CM) else 0,
+        "relay2": 0,   # time-based — ESP32 controls this
+        "relay3": 1 if soil > SOIL_DRY_THRESHOLD else 0,
+        "relay4": 1 if ldr  < LDR_DARK_THRESHOLD else 0,
+    }
+
+# ── ML retrain ────────────────────────────────────────────────
+def retrain_model():
+    try:
+        log.info("[RETRAIN] Starting background retrain...")
+        db     = get_db()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT temperature, humidity, ldr_value,
+                   soil_moisture, distance, relay4_light
+            FROM sensor_data
+        """)
+        rows = cursor.fetchall()
+        db.close()
+
+        if len(rows) < 10:
+            log.warning("[RETRAIN] Not enough rows (%d)", len(rows))
+            return
+
+        df = pd.DataFrame(rows)
+        X  = df[["temperature", "humidity", "ldr_value",
+                  "soil_moisture", "distance"]]
+        y  = df["relay4_light"]  # predict light status
+
+        new_model = RandomForestClassifier(
+            n_estimators=100,
+            random_state=42,
+            max_depth=10
+        )
+        new_model.fit(X, y)
+        accuracy = round(new_model.score(X, y) * 100, 2)
+
+        joblib.dump(new_model, MODEL_PATH)
+
+        with model_state["lock"]:
+            model_state["model"]          = new_model
+            model_state["trained_on"]     = len(rows)
+            model_state["last_retrained"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        log.info("[RETRAIN] Done — %d rows — accuracy %.2f%%", len(rows), accuracy)
+
+    except Exception as e:
+        log.error("[RETRAIN] Failed: %s", e)
+
+def maybe_retrain():
+    try:
+        db     = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM sensor_data")
+        total = cursor.fetchone()[0]
+        db.close()
+
+        if total - model_state["trained_on"] >= RETRAIN_EVERY:
+            thread = threading.Thread(target=retrain_model, daemon=True)
+            thread.start()
+    except Exception as e:
+        log.error("[RETRAIN CHECK] %s", e)
+
+# ── ML prediction ─────────────────────────────────────────────
+def predict_light(temperature, humidity, ldr, soil, distance):
+    with model_state["lock"]:
+        current_model = model_state["model"]
+
+    if current_model is not None:
         df = pd.DataFrame([{
-            "temperature": temperature,
-            "humidity":    humidity,
-            "ldr_value":   ldr_value
+            "temperature":  temperature,
+            "humidity":     humidity,
+            "ldr_value":    ldr,
+            "soil_moisture": soil,
+            "distance":     distance
         }])
-        return int(model.predict(df)[0])
-    # Fallback rule (matches training logic)
-    return 1 if ldr_value >= 3800 else 0
+        return int(current_model.predict(df)[0])
+
+    # Rule fallback
+    return 1 if ldr < LDR_DARK_THRESHOLD else 0
+
+def ts_fix(rows):
+    """Convert datetime objects to strings for JSON."""
+    for r in rows:
+        if isinstance(r.get("timestamp"), datetime):
+            r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+    return rows
 
 # ── Error handler ─────────────────────────────────────────────
 @app.errorhandler(Exception)
 def handle_error(e):
-    log.error("Unhandled exception: %s", e)
+    log.error("Unhandled: %s", e)
     return jsonify({"error": str(e)}), 500
 
-# ═════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
 # ROUTES
-# ═════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
 
-# ── Health check ──────────────────────────────────────────────
 @app.route("/")
 def home():
+    with model_state["lock"]:
+        has_model  = model_state["model"] is not None
+        trained_on = model_state["trained_on"]
+        last_rt    = model_state["last_retrained"]
     return jsonify({
-        "status":  "SmartFarm API online",
-        "version": "3.0",
-        "model":   "loaded" if model else "not loaded (fallback rule active)"
+        "status":         "SmartFarm API v2.0 online",
+        "sensors":        ["DHT22", "LDR", "Soil Moisture", "Ultrasonic"],
+        "relays":         ["Pump1(ultrasonic)", "Feeder(timer)",
+                           "Pump2(soil)", "Light(ldr)"],
+        "model":          "loaded" if has_model else "rule fallback",
+        "trained_on":     f"{trained_on} rows",
+        "last_retrained": last_rt or "never",
+        "retrain_every":  f"{RETRAIN_EVERY} new rows"
     })
 
 @app.route("/health")
 def health():
-    """Render health-check endpoint."""
     try:
         db = get_db()
         db.close()
-        return jsonify({"db": "ok", "model": "ok" if model else "fallback"}), 200
+        with model_state["lock"]:
+            has_model = model_state["model"] is not None
+        return jsonify({"db": "ok", "model": "loaded" if has_model else "fallback"}), 200
     except Exception as e:
         return jsonify({"db": "error", "detail": str(e)}), 500
 
-# ── ESP32 data upload ─────────────────────────────────────────
+@app.route("/model-status")
+def model_status():
+    try:
+        db     = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM sensor_data")
+        total = cursor.fetchone()[0]
+        db.close()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    with model_state["lock"]:
+        trained_on = model_state["trained_on"]
+        last_rt    = model_state["last_retrained"]
+        has_model  = model_state["model"] is not None
+
+    return jsonify({
+        "model_loaded":       has_model,
+        "total_rows_in_db":   total,
+        "trained_on_rows":    trained_on,
+        "new_rows_since":     total - trained_on,
+        "rows_until_retrain": RETRAIN_EVERY - ((total - trained_on) % RETRAIN_EVERY),
+        "last_retrained":     last_rt or "never",
+        "retrain_every":      RETRAIN_EVERY
+    })
+
 @app.route("/upload")
 def upload():
     """
-    GET /upload?temperature=28.5&humidity=64.2&ldr_value=3900
+    GET /upload?temperature=&humidity=&ldr_value=
+                &soil_moisture=&distance=
+                &relay1=&relay2=&relay3=&relay4=
 
-    Called by ESP32 every 60 seconds.
-    Runs ML prediction, stores result, returns JSON.
-    Using GET so the ESP32 HTTPClient.begin(url) works without
-    setting a Content-Type header.
+    ESP32 sends all sensor values + relay states it applied.
+    Backend also runs ML prediction and saves everything.
     """
     try:
-        temperature = float(request.args.get("temperature", 0))
-        humidity    = float(request.args.get("humidity",    0))
-        ldr_value   = int(request.args.get("ldr_value",     0))
+        temperature   = float(request.args.get("temperature",   0))
+        humidity      = float(request.args.get("humidity",      0))
+        ldr_value     = int(request.args.get("ldr_value",       0))
+        soil_moisture = int(request.args.get("soil_moisture",   0))
+        distance      = float(request.args.get("distance",      0))
+        # Relay states reported by ESP32
+        relay1        = int(request.args.get("relay1",          0))
+        relay2        = int(request.args.get("relay2",          0))
+        relay3        = int(request.args.get("relay3",          0))
+        relay4        = int(request.args.get("relay4",          0))
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"Bad parameter: {e}"}), 400
 
-    # Validate ranges
-    if not (-10 <= temperature <= 60):
-        return jsonify({"error": "temperature out of range"}), 422
-    if not (0 <= humidity <= 100):
-        return jsonify({"error": "humidity out of range"}), 422
-    if not (0 <= ldr_value <= 4095):
-        return jsonify({"error": "ldr_value out of range"}), 422
-
-    light_status = predict_light(temperature, humidity, ldr_value)
+    # ML predicts light status independently for comparison
+    ml_light = predict_light(temperature, humidity, ldr_value,
+                             soil_moisture, distance)
 
     try:
         db     = get_db()
         cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO sensor_data (temperature, humidity, ldr_value, light_status) VALUES (%s, %s, %s, %s)",
-            (temperature, humidity, ldr_value, light_status)
-        )
+        cursor.execute("""
+            INSERT INTO sensor_data
+            (temperature, humidity, ldr_value, soil_moisture, distance,
+             relay1_pump1, relay2_feeder, relay3_pump2, relay4_light)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (temperature, humidity, ldr_value, soil_moisture, distance,
+              relay1, relay2, relay3, relay4))
         db.commit()
         new_id = cursor.lastrowid
         db.close()
     except MySQLError as e:
-        log.error("DB insert failed: %s", e)
-        return jsonify({"error": "Database write failed"}), 500
+        return jsonify({"error": "DB write failed"}), 500
 
-    log.info("Saved id=%s temp=%.1f hum=%.1f ldr=%d light=%d",
-             new_id, temperature, humidity, ldr_value, light_status)
+    maybe_retrain()
+
+    log.info("id=%s temp=%.1f hum=%.1f ldr=%d soil=%d dist=%.1f "
+             "r1=%d r2=%d r3=%d r4=%d",
+             new_id, temperature, humidity, ldr_value,
+             soil_moisture, distance, relay1, relay2, relay3, relay4)
 
     return jsonify({
-        "status":                "saved",
-        "id":                    new_id,
-        "temperature":           temperature,
-        "humidity":              humidity,
-        "ldr_value":             ldr_value,
-        "predicted_light_status": light_status
+        "status":             "saved",
+        "id":                 new_id,
+        "temperature":        temperature,
+        "humidity":           humidity,
+        "ldr_value":          ldr_value,
+        "soil_moisture":      soil_moisture,
+        "distance":           distance,
+        "relay1_pump1":       relay1,
+        "relay2_feeder":      relay2,
+        "relay3_pump2":       relay3,
+        "relay4_light":       relay4,
+        "ml_light_prediction": ml_light
     })
 
-# ── ML predict only (no DB write) ────────────────────────────
 @app.route("/predict")
 def predict():
     """
-    GET /predict?temperature=28.5&humidity=64.2&ldr_value=3900
-    Returns ML prediction without storing anything.
-    Useful for testing the model.
+    GET /predict?temperature=&humidity=&ldr_value=
+                 &soil_moisture=&distance=
+    Returns ML prediction + rule-based decisions for all relays.
     """
     try:
-        temperature = float(request.args.get("temperature", 0))
-        humidity    = float(request.args.get("humidity",    0))
-        ldr_value   = int(request.args.get("ldr_value",     0))
+        temperature   = float(request.args.get("temperature",   0))
+        humidity      = float(request.args.get("humidity",      0))
+        ldr_value     = int(request.args.get("ldr_value",       0))
+        soil_moisture = int(request.args.get("soil_moisture",   0))
+        distance      = float(request.args.get("distance",      0))
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"Bad parameter: {e}"}), 400
 
-    light_status = predict_light(temperature, humidity, ldr_value)
+    rules    = apply_rules(ldr_value, soil_moisture, distance)
+    ml_light = predict_light(temperature, humidity, ldr_value,
+                             soil_moisture, distance)
+
+    with model_state["lock"]:
+        has_model  = model_state["model"] is not None
+        trained_on = model_state["trained_on"]
 
     return jsonify({
-        "temperature":           temperature,
-        "humidity":              humidity,
-        "ldr_value":             ldr_value,
-        "predicted_light_status": light_status,
-        "model_used":            "ml" if model else "rule_fallback"
+        "inputs": {
+            "temperature":   temperature,
+            "humidity":      humidity,
+            "ldr_value":     ldr_value,
+            "soil_moisture": soil_moisture,
+            "distance":      distance
+        },
+        "relay_decisions": {
+            "relay1_pump1":  rules["relay1"],
+            "relay2_feeder": "timer-based (ESP32)",
+            "relay3_pump2":  rules["relay3"],
+            "relay4_light":  ml_light
+        },
+        "reasons": {
+            "relay1": f"distance {distance}cm {'< 10cm → ON' if rules['relay1'] else '>= 10cm → OFF'}",
+            "relay2": "ON for 5s every 1 minute — controlled by ESP32 timer",
+            "relay3": f"soil {soil_moisture} {'> 2500 → ON (dry)' if rules['relay3'] else '<= 2500 → OFF (wet)'}",
+            "relay4": f"ldr {ldr_value} {'< 1500 → ON (dark)' if ml_light else '>= 1500 → OFF (bright)'}"
+        },
+        "model_used":       "ml" if has_model else "rule_fallback",
+        "model_trained_on": f"{trained_on} rows"
     })
 
-# ── Demo data insert ──────────────────────────────────────────
 @app.route("/demo")
 def demo():
-    """
-    GET /demo
-    Inserts one random row — useful for testing the DB
-    and dashboard without an ESP32.
-    """
     import random
-    temperature  = round(random.uniform(20, 35), 2)
-    humidity     = round(random.uniform(40, 80), 2)
-    ldr_value    = random.randint(0, 4095)
-    light_status = predict_light(temperature, humidity, ldr_value)
-
+    temperature   = round(random.uniform(20, 35), 2)
+    humidity      = round(random.uniform(40, 80), 2)
+    ldr_value     = random.randint(0, 4095)
+    soil_moisture = random.randint(1000, 4000)
+    distance      = round(random.uniform(2, 30), 2)
+    rules         = apply_rules(ldr_value, soil_moisture, distance)
+    ml_light      = predict_light(temperature, humidity, ldr_value,
+                                  soil_moisture, distance)
     try:
         db     = get_db()
         cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO sensor_data (temperature, humidity, ldr_value, light_status) VALUES (%s, %s, %s, %s)",
-            (temperature, humidity, ldr_value, light_status)
-        )
+        cursor.execute("""
+            INSERT INTO sensor_data
+            (temperature, humidity, ldr_value, soil_moisture, distance,
+             relay1_pump1, relay2_feeder, relay3_pump2, relay4_light)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (temperature, humidity, ldr_value, soil_moisture, distance,
+              rules["relay1"], 0, rules["relay3"], ml_light))
         db.commit()
         db.close()
     except MySQLError as e:
         return jsonify({"error": str(e)}), 500
 
+    maybe_retrain()
+
     return jsonify({
-        "status":      "demo row inserted",
-        "temperature": temperature,
-        "humidity":    humidity,
-        "ldr_value":   ldr_value,
-        "light_status": light_status
+        "status":        "demo row inserted",
+        "temperature":   temperature,
+        "humidity":      humidity,
+        "ldr_value":     ldr_value,
+        "soil_moisture": soil_moisture,
+        "distance":      distance,
+        "relay1_pump1":  rules["relay1"],
+        "relay2_feeder": 0,
+        "relay3_pump2":  rules["relay3"],
+        "relay4_light":  ml_light
     })
 
-# ── Latest reading ────────────────────────────────────────────
 @app.route("/latest")
 def latest():
-    """GET /latest — most recent sensor row."""
     try:
         db     = get_db()
         cursor = db.cursor(dictionary=True)
@@ -262,18 +421,15 @@ def latest():
         return jsonify({"error": str(e)}), 500
 
     if not row:
-        return jsonify({"error": "No data yet"}), 404
+        return jsonify({"error": "No data yet — call /demo first"}), 404
 
-    # Make timestamp JSON-serialisable
     if isinstance(row.get("timestamp"), datetime):
         row["timestamp"] = row["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
 
     return jsonify(row)
 
-# ── All history ───────────────────────────────────────────────
 @app.route("/sensor-data")
 def sensor_data():
-    """GET /sensor-data?limit=100 — newest first."""
     limit = min(int(request.args.get("limit", 100)), 1000)
     try:
         db     = get_db()
@@ -286,21 +442,14 @@ def sensor_data():
     except MySQLError as e:
         return jsonify({"error": str(e)}), 500
 
-    for r in rows:
-        if isinstance(r.get("timestamp"), datetime):
-            r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(ts_fix(rows))
 
-    return jsonify(rows)
-
-# ── Chart data ────────────────────────────────────────────────
 @app.route("/chart-data")
 def chart_data():
-    """GET /chart-data?points=50 — oldest→newest for chart X axis."""
     points = min(int(request.args.get("points", 50)), 200)
     try:
         db     = get_db()
         cursor = db.cursor(dictionary=True)
-        # Sub-query: take last N rows, then reverse for chronological order
         cursor.execute("""
             SELECT * FROM (
                 SELECT * FROM sensor_data ORDER BY id DESC LIMIT %s
@@ -311,16 +460,10 @@ def chart_data():
     except MySQLError as e:
         return jsonify({"error": str(e)}), 500
 
-    for r in rows:
-        if isinstance(r.get("timestamp"), datetime):
-            r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(ts_fix(rows))
 
-    return jsonify(rows)
-
-# ── CSV export ────────────────────────────────────────────────
 @app.route("/export/csv")
 def export_csv():
-    """GET /export/csv — download all data as CSV file."""
     try:
         db     = get_db()
         cursor = db.cursor(dictionary=True)
@@ -332,14 +475,18 @@ def export_csv():
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "timestamp", "temperature", "humidity", "ldr_value", "light_status"])
-
+    writer.writerow(["id", "timestamp", "temperature", "humidity",
+                     "ldr_value", "soil_moisture", "distance",
+                     "relay1_pump1", "relay2_feeder",
+                     "relay3_pump2", "relay4_light"])
     for r in rows:
         ts = r["timestamp"]
         if isinstance(ts, datetime):
             ts = ts.strftime("%Y-%m-%d %H:%M:%S")
-        writer.writerow([r["id"], ts, r["temperature"],
-                         r["humidity"], r["ldr_value"], r["light_status"]])
+        writer.writerow([r["id"], ts, r["temperature"], r["humidity"],
+                         r["ldr_value"], r["soil_moisture"], r["distance"],
+                         r["relay1_pump1"], r["relay2_feeder"],
+                         r["relay3_pump2"], r["relay4_light"]])
 
     filename = f"smartfarm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return Response(
@@ -348,9 +495,8 @@ def export_csv():
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-# ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
-    log.info("Starting on port %s", port)
+    log.info("Starting SmartFarm v2.0 on port %s", port)
     app.run(host="0.0.0.0", port=port, debug=False)
