@@ -98,14 +98,13 @@ def init_db():
         log.error("DB init failed: %s", e)
 
 # ── Rule-based decisions ──────────────────────────────────────
-def apply_rules(ldr: int, soil: int, distance: float,
-                feeder_active: bool = False) -> dict:
+def apply_rules(ldr: int, soil: int, distance: float) -> dict:
     return {
         "relay1": 1 if (distance > 0 and distance > TANK_LOW_CM) else 0,
-        "relay2": 1 if soil > SOIL_DRY_VAL else 0,
-        "relay3": 1 if ldr  < LDR_DARK_VAL else 0,
-        "relay4": 1 if feeder_active else 0,
-        "servo":  90 if soil > SOIL_DRY_VAL else 0
+        "relay2": 0,   # timer based — ESP32 controls this
+        "relay3": 1 if soil > SOIL_DRY_VAL else 0,
+        "relay4": 1 if ldr  < LDR_DARK_VAL else 0,
+        "servo":  "follows relay2 timer"
     }
 
 # ── ML retrain ────────────────────────────────────────────────
@@ -392,14 +391,13 @@ def predict():
         },
         "reasons": {
             "relay1": f"tank dist {distance}cm "
-                      f"{'< 10 → PUMP ON' if rules['relay1'] else '<= 15 → PUMP OFF'}",
-            "relay2": f"soil {soil_moisture} "
-                      f"{'> 2500 → DRY → PUMP ON' if rules['relay2'] else '<= 2500 → WET → PUMP OFF'}",
-            "relay3": f"ldr {ldr_value} "
-                      f"{'< 1500 → DARK → LIGHT ON' if ml_light else '>= 1500 → BRIGHT → LIGHT OFF'}",
-            "relay4": "ESP32 timer — independent",
-            "servo":  f"soil {soil_moisture} "
-                      f"{'> 2500 → 90° open' if rules['servo'] == 90 else '<= 2500 → 0° closed'}"
+                      f"{'> 15 → PUMP ON' if rules['relay1'] else '<= 15 → PUMP OFF'}",
+            "relay2": "timer — ON 5s every 1min → servo sweeps to 90°",
+            "relay3": f"soil {soil_moisture} "
+              f"{'> 2500 → DRY → PUMP2 ON' if rules['relay3'] else '<= 2500 → WET → PUMP2 OFF'}",
+            "relay4": f"ldr {ldr_value} "
+              f"{'< 1500 → DARK → LIGHT ON' if rules['relay4'] else '>= 1500 → BRIGHT → LIGHT OFF'}",
+            "servo":  "sweeps 0°→90° when feeder relay2 activates every 1min"
         },
         "model_used":   "ml" if has_model else "rule_fallback",
         "trained_on":   f"{trained_on} rows",
