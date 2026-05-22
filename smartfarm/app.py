@@ -36,7 +36,7 @@ RETRAIN_EVERY = 100   # retrain every 100 new rows
                       # 100 rows × 15s = every ~25 minutes
 
 # ── Thresholds — must match ESP32 sketch ─────────────────────
-TANK_LOW_CM      = 10.0
+TANK_LOW_CM      = 15.0
 SOIL_DRY_VAL     = 2500
 LDR_DARK_VAL     = 1500
 
@@ -101,7 +101,7 @@ def init_db():
 def apply_rules(ldr: int, soil: int, distance: float,
                 feeder_active: bool = False) -> dict:
     return {
-        "relay1": 1 if (distance > 0 and distance < TANK_LOW_CM) else 0,
+        "relay1": 1 if (distance > 0 and distance > TANK_LOW_CM) else 0,
         "relay2": 1 if soil > SOIL_DRY_VAL else 0,
         "relay3": 1 if ldr  < LDR_DARK_VAL else 0,
         "relay4": 1 if feeder_active else 0,
@@ -392,7 +392,7 @@ def predict():
         },
         "reasons": {
             "relay1": f"tank dist {distance}cm "
-                      f"{'< 10 → PUMP ON' if rules['relay1'] else '>= 10 → PUMP OFF'}",
+                      f"{'< 10 → PUMP ON' if rules['relay1'] else '<= 15 → PUMP OFF'}",
             "relay2": f"soil {soil_moisture} "
                       f"{'> 2500 → DRY → PUMP ON' if rules['relay2'] else '<= 2500 → WET → PUMP OFF'}",
             "relay3": f"ldr {ldr_value} "
