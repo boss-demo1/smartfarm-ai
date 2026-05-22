@@ -1,8 +1,9 @@
 """
-SmartFarm IoT v2.0 — Cloud Backend
+SmartFarm IoT — Final Backend v3.0
 Flask + MySQL (Railway) + Auto-retraining ML
 Sensors  : DHT22, LDR, Soil Moisture, Ultrasonic
-Relays   : Pump1, Feeder, Pump2, Light
+Actuators: Relay x4, Servo Motor
+Interval : 15 seconds
 """
 
 import os
@@ -31,33 +32,35 @@ CORS(app)
 
 # ── Constants ─────────────────────────────────────────────────
 MODEL_PATH    = os.path.join(os.path.dirname(__file__), "smartfarm_model.pkl")
-RETRAIN_EVERY = 50
+RETRAIN_EVERY = 100   # retrain every 100 new rows
+                      # 100 rows × 15s = every ~25 minutes
 
-# ── Automation thresholds — must match ESP32 sketch ───────────
-ULTRASONIC_LOW_CM  = 10.0   # below 10cm  → Pump1 ON
-SOIL_DRY_THRESHOLD = 2500   # above 2500  → Pump2 ON
-LDR_DARK_THRESHOLD = 1500   # below 1500  → Light ON
+# ── Thresholds — must match ESP32 sketch ─────────────────────
+TANK_LOW_CM      = 10.0
+SOIL_DRY_VAL     = 2500
+LDR_DARK_VAL     = 1500
 
 # ── Model state ───────────────────────────────────────────────
 model_state = {
     "model":          None,
     "trained_on":     0,
     "last_retrained": None,
+    "accuracy":       None,
     "lock":           threading.Lock()
 }
 
 try:
     model_state["model"] = joblib.load(MODEL_PATH)
-    log.info("ML model loaded from %s", MODEL_PATH)
+    log.info("ML model loaded → %s", MODEL_PATH)
 except FileNotFoundError:
-    log.warning("No model found — rule-based fallback active")
+    log.warning("No model found — rule fallback active until first retrain")
 
 # ── Database ──────────────────────────────────────────────────
 def get_db():
     required = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"]
     missing  = [k for k in required if not os.environ.get(k)]
     if missing:
-        raise RuntimeError(f"Missing env variables: {missing}")
+        raise RuntimeError(f"Missing env vars: {missing}")
     return mysql.connector.connect(
         host               = os.environ["DB_HOST"],
         user               = os.environ["DB_USER"],
@@ -68,7 +71,6 @@ def get_db():
     )
 
 def init_db():
-    """Create table with all sensor and relay columns."""
     sql = """
         CREATE TABLE IF NOT EXISTS sensor_data (
             id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -78,10 +80,11 @@ def init_db():
             ldr_value     INT        NOT NULL,
             soil_moisture INT        NOT NULL DEFAULT 0,
             distance      FLOAT      NOT NULL DEFAULT 0,
+            servo_angle   INT        NOT NULL DEFAULT 0,
             relay1_pump1  TINYINT(1) NOT NULL DEFAULT 0,
-            relay2_feeder TINYINT(1) NOT NULL DEFAULT 0,
-            relay3_pump2  TINYINT(1) NOT NULL DEFAULT 0,
-            relay4_light  TINYINT(1) NOT NULL DEFAULT 0
+            relay2_pump2  TINYINT(1) NOT NULL DEFAULT 0,
+            relay3_light  TINYINT(1) NOT NULL DEFAULT 0,
+            relay4_feeder TINYINT(1) NOT NULL DEFAULT 0
         )
     """
     try:
@@ -92,44 +95,47 @@ def init_db():
         db.close()
         log.info("Database table ready")
     except Exception as e:
-        log.error("Database init failed: %s", e)
+        log.error("DB init failed: %s", e)
 
-# ── Rule-based automation ─────────────────────────────────────
-def apply_rules(ldr: int, soil: int, distance: float) -> dict:
-    """
-    Derive relay states from sensor values.
-    relay2 (feeder) is time-based — handled by ESP32 directly.
-    Backend just records what ESP32 reported.
-    """
+# ── Rule-based decisions ──────────────────────────────────────
+def apply_rules(ldr: int, soil: int, distance: float,
+                feeder_active: bool = False) -> dict:
     return {
-        "relay1": 1 if (distance > 0 and distance < ULTRASONIC_LOW_CM) else 0,
-        "relay2": 0,   # time-based — ESP32 controls this
-        "relay3": 1 if soil > SOIL_DRY_THRESHOLD else 0,
-        "relay4": 1 if ldr  < LDR_DARK_THRESHOLD else 0,
+        "relay1": 1 if (distance > 0 and distance < TANK_LOW_CM) else 0,
+        "relay2": 1 if soil > SOIL_DRY_VAL else 0,
+        "relay3": 1 if ldr  < LDR_DARK_VAL else 0,
+        "relay4": 1 if feeder_active else 0,
+        "servo":  90 if soil > SOIL_DRY_VAL else 0
     }
 
 # ── ML retrain ────────────────────────────────────────────────
 def retrain_model():
+    """
+    Pull all rows from MySQL and retrain the Random Forest.
+    Runs in a background thread — never blocks the API.
+    After 100 new rows (100 × 15s = ~25 min) this triggers automatically.
+    """
     try:
-        log.info("[RETRAIN] Starting background retrain...")
+        log.info("[RETRAIN] Starting — pulling all rows from MySQL...")
+
         db     = get_db()
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
             SELECT temperature, humidity, ldr_value,
-                   soil_moisture, distance, relay4_light
+                   soil_moisture, distance, relay3_light
             FROM sensor_data
         """)
         rows = cursor.fetchall()
         db.close()
 
-        if len(rows) < 10:
-            log.warning("[RETRAIN] Not enough rows (%d)", len(rows))
+        if len(rows) < 20:
+            log.warning("[RETRAIN] Not enough rows (%d) — need 20+", len(rows))
             return
 
         df = pd.DataFrame(rows)
         X  = df[["temperature", "humidity", "ldr_value",
                   "soil_moisture", "distance"]]
-        y  = df["relay4_light"]  # predict light status
+        y  = df["relay3_light"]
 
         new_model = RandomForestClassifier(
             n_estimators=100,
@@ -137,14 +143,15 @@ def retrain_model():
             max_depth=10
         )
         new_model.fit(X, y)
-        accuracy = round(new_model.score(X, y) * 100, 2)
 
+        accuracy = round(new_model.score(X, y) * 100, 2)
         joblib.dump(new_model, MODEL_PATH)
 
         with model_state["lock"]:
             model_state["model"]          = new_model
             model_state["trained_on"]     = len(rows)
             model_state["last_retrained"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            model_state["accuracy"]       = accuracy
 
         log.info("[RETRAIN] Done — %d rows — accuracy %.2f%%", len(rows), accuracy)
 
@@ -152,6 +159,7 @@ def retrain_model():
         log.error("[RETRAIN] Failed: %s", e)
 
 def maybe_retrain():
+    """Check if enough new rows to trigger retrain."""
     try:
         db     = get_db()
         cursor = db.cursor()
@@ -159,9 +167,11 @@ def maybe_retrain():
         total = cursor.fetchone()[0]
         db.close()
 
-        if total - model_state["trained_on"] >= RETRAIN_EVERY:
-            thread = threading.Thread(target=retrain_model, daemon=True)
-            thread.start()
+        new_rows = total - model_state["trained_on"]
+        if new_rows >= RETRAIN_EVERY:
+            log.info("[RETRAIN] Triggered — %d new rows", new_rows)
+            t = threading.Thread(target=retrain_model, daemon=True)
+            t.start()
     except Exception as e:
         log.error("[RETRAIN CHECK] %s", e)
 
@@ -180,11 +190,10 @@ def predict_light(temperature, humidity, ldr, soil, distance):
         }])
         return int(current_model.predict(df)[0])
 
-    # Rule fallback
-    return 1 if ldr < LDR_DARK_THRESHOLD else 0
+    # Rule fallback before first model is trained
+    return 1 if ldr < LDR_DARK_VAL else 0
 
-def ts_fix(rows):
-    """Convert datetime objects to strings for JSON."""
+def fix_timestamps(rows):
     for r in rows:
         if isinstance(r.get("timestamp"), datetime):
             r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
@@ -206,15 +215,20 @@ def home():
         has_model  = model_state["model"] is not None
         trained_on = model_state["trained_on"]
         last_rt    = model_state["last_retrained"]
+        accuracy   = model_state["accuracy"]
     return jsonify({
-        "status":         "SmartFarm API v2.0 online",
-        "sensors":        ["DHT22", "LDR", "Soil Moisture", "Ultrasonic"],
-        "relays":         ["Pump1(ultrasonic)", "Feeder(timer)",
-                           "Pump2(soil)", "Light(ldr)"],
+        "status":         "SmartFarm API v3.0 online",
+        "interval":       "15 seconds",
+        "sensors":        ["DHT22(D4)", "LDR(D34)",
+                           "Soil(D35)", "Ultrasonic(D27/D33)"],
+        "actuators":      ["Relay1-Pump1(D14)", "Relay2-Pump2(D12)",
+                           "Relay3-Light(D13)", "Relay4-Feeder(D15)",
+                           "Servo(D25)"],
         "model":          "loaded" if has_model else "rule fallback",
         "trained_on":     f"{trained_on} rows",
-        "last_retrained": last_rt or "never",
-        "retrain_every":  f"{RETRAIN_EVERY} new rows"
+        "last_retrained": last_rt   or "never",
+        "accuracy":       f"{accuracy}%" if accuracy else "pending",
+        "retrain_every":  f"{RETRAIN_EVERY} rows (~{RETRAIN_EVERY * 15 // 60} min)"
     })
 
 @app.route("/health")
@@ -224,7 +238,10 @@ def health():
         db.close()
         with model_state["lock"]:
             has_model = model_state["model"] is not None
-        return jsonify({"db": "ok", "model": "loaded" if has_model else "fallback"}), 200
+        return jsonify({
+            "db":    "ok",
+            "model": "loaded" if has_model else "fallback"
+        }), 200
     except Exception as e:
         return jsonify({"db": "error", "detail": str(e)}), 500
 
@@ -243,26 +260,34 @@ def model_status():
         trained_on = model_state["trained_on"]
         last_rt    = model_state["last_retrained"]
         has_model  = model_state["model"] is not None
+        accuracy   = model_state["accuracy"]
+
+    new_rows        = total - trained_on
+    rows_to_retrain = RETRAIN_EVERY - (new_rows % RETRAIN_EVERY)
+    mins_to_retrain = (rows_to_retrain * 15) // 60
 
     return jsonify({
-        "model_loaded":       has_model,
-        "total_rows_in_db":   total,
-        "trained_on_rows":    trained_on,
-        "new_rows_since":     total - trained_on,
-        "rows_until_retrain": RETRAIN_EVERY - ((total - trained_on) % RETRAIN_EVERY),
-        "last_retrained":     last_rt or "never",
-        "retrain_every":      RETRAIN_EVERY
+        "model_loaded":         has_model,
+        "accuracy":             f"{accuracy}%" if accuracy else "pending",
+        "total_rows_in_db":     total,
+        "trained_on_rows":      trained_on,
+        "new_rows_since_train": new_rows,
+        "rows_until_retrain":   rows_to_retrain,
+        "mins_until_retrain":   mins_to_retrain,
+        "last_retrained":       last_rt or "never",
+        "retrain_every":        f"{RETRAIN_EVERY} rows"
     })
 
 @app.route("/upload")
 def upload():
     """
-    GET /upload?temperature=&humidity=&ldr_value=
-                &soil_moisture=&distance=
-                &relay1=&relay2=&relay3=&relay4=
+    GET /upload?temperature=&humidity=&ldr_value=&soil_moisture=
+               &distance=&servo_angle=&relay1=&relay2=&relay3=&relay4=
 
-    ESP32 sends all sensor values + relay states it applied.
-    Backend also runs ML prediction and saves everything.
+    Called by ESP32 every 15 seconds.
+    Saves all sensor values + relay states.
+    ML predicts light status independently.
+    Triggers retrain every 100 new rows (~25 min).
     """
     try:
         temperature   = float(request.args.get("temperature",   0))
@@ -270,7 +295,7 @@ def upload():
         ldr_value     = int(request.args.get("ldr_value",       0))
         soil_moisture = int(request.args.get("soil_moisture",   0))
         distance      = float(request.args.get("distance",      0))
-        # Relay states reported by ESP32
+        servo_angle   = int(request.args.get("servo_angle",     0))
         relay1        = int(request.args.get("relay1",          0))
         relay2        = int(request.args.get("relay2",          0))
         relay3        = int(request.args.get("relay3",          0))
@@ -278,46 +303,51 @@ def upload():
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"Bad parameter: {e}"}), 400
 
-    # ML predicts light status independently for comparison
-    ml_light = predict_light(temperature, humidity, ldr_value,
-                             soil_moisture, distance)
+    # ML independently predicts light status
+    ml_light = predict_light(temperature, humidity,
+                             ldr_value, soil_moisture, distance)
 
     try:
         db     = get_db()
         cursor = db.cursor()
         cursor.execute("""
             INSERT INTO sensor_data
-            (temperature, humidity, ldr_value, soil_moisture, distance,
-             relay1_pump1, relay2_feeder, relay3_pump2, relay4_light)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (temperature, humidity, ldr_value, soil_moisture, distance,
+            (temperature, humidity, ldr_value, soil_moisture,
+             distance, servo_angle,
+             relay1_pump1, relay2_pump2, relay3_light, relay4_feeder)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (temperature, humidity, ldr_value, soil_moisture,
+              distance, servo_angle,
               relay1, relay2, relay3, relay4))
         db.commit()
         new_id = cursor.lastrowid
         db.close()
     except MySQLError as e:
-        return jsonify({"error": "DB write failed"}), 500
+        log.error("DB insert failed: %s", e)
+        return jsonify({"error": "Database write failed"}), 500
 
     maybe_retrain()
 
-    log.info("id=%s temp=%.1f hum=%.1f ldr=%d soil=%d dist=%.1f "
-             "r1=%d r2=%d r3=%d r4=%d",
+    log.info("id=%s | t=%.1f h=%.1f ldr=%d soil=%d dist=%.1f "
+             "sv=%d° r1=%d r2=%d r3=%d r4=%d ml=%d",
              new_id, temperature, humidity, ldr_value,
-             soil_moisture, distance, relay1, relay2, relay3, relay4)
+             soil_moisture, distance, servo_angle,
+             relay1, relay2, relay3, relay4, ml_light)
 
     return jsonify({
-        "status":             "saved",
-        "id":                 new_id,
-        "temperature":        temperature,
-        "humidity":           humidity,
-        "ldr_value":          ldr_value,
-        "soil_moisture":      soil_moisture,
-        "distance":           distance,
-        "relay1_pump1":       relay1,
-        "relay2_feeder":      relay2,
-        "relay3_pump2":       relay3,
-        "relay4_light":       relay4,
-        "ml_light_prediction": ml_light
+        "status":            "saved",
+        "id":                new_id,
+        "temperature":       temperature,
+        "humidity":          humidity,
+        "ldr_value":         ldr_value,
+        "soil_moisture":     soil_moisture,
+        "distance":          distance,
+        "servo_angle":       servo_angle,
+        "relay1_pump1":      relay1,
+        "relay2_pump2":      relay2,
+        "relay3_light":      relay3,
+        "relay4_feeder":     relay4,
+        "ml_light_predict":  ml_light
     })
 
 @app.route("/predict")
@@ -325,7 +355,7 @@ def predict():
     """
     GET /predict?temperature=&humidity=&ldr_value=
                  &soil_moisture=&distance=
-    Returns ML prediction + rule-based decisions for all relays.
+    Returns ML prediction + all relay decisions with reasons.
     """
     try:
         temperature   = float(request.args.get("temperature",   0))
@@ -337,12 +367,13 @@ def predict():
         return jsonify({"error": f"Bad parameter: {e}"}), 400
 
     rules    = apply_rules(ldr_value, soil_moisture, distance)
-    ml_light = predict_light(temperature, humidity, ldr_value,
-                             soil_moisture, distance)
+    ml_light = predict_light(temperature, humidity,
+                             ldr_value, soil_moisture, distance)
 
     with model_state["lock"]:
         has_model  = model_state["model"] is not None
         trained_on = model_state["trained_on"]
+        accuracy   = model_state["accuracy"]
 
     return jsonify({
         "inputs": {
@@ -350,45 +381,57 @@ def predict():
             "humidity":      humidity,
             "ldr_value":     ldr_value,
             "soil_moisture": soil_moisture,
-            "distance":      distance
+            "distance_cm":   distance
         },
-        "relay_decisions": {
+        "decisions": {
             "relay1_pump1":  rules["relay1"],
-            "relay2_feeder": "timer-based (ESP32)",
-            "relay3_pump2":  rules["relay3"],
-            "relay4_light":  ml_light
+            "relay2_pump2":  rules["relay2"],
+            "relay3_light":  ml_light,
+            "relay4_feeder": "timer — ON 5s every 1min",
+            "servo_angle":   rules["servo"]
         },
         "reasons": {
-            "relay1": f"distance {distance}cm {'< 10cm → ON' if rules['relay1'] else '>= 10cm → OFF'}",
-            "relay2": "ON for 5s every 1 minute — controlled by ESP32 timer",
-            "relay3": f"soil {soil_moisture} {'> 2500 → ON (dry)' if rules['relay3'] else '<= 2500 → OFF (wet)'}",
-            "relay4": f"ldr {ldr_value} {'< 1500 → ON (dark)' if ml_light else '>= 1500 → OFF (bright)'}"
+            "relay1": f"tank dist {distance}cm "
+                      f"{'< 10 → PUMP ON' if rules['relay1'] else '>= 10 → PUMP OFF'}",
+            "relay2": f"soil {soil_moisture} "
+                      f"{'> 2500 → DRY → PUMP ON' if rules['relay2'] else '<= 2500 → WET → PUMP OFF'}",
+            "relay3": f"ldr {ldr_value} "
+                      f"{'< 1500 → DARK → LIGHT ON' if ml_light else '>= 1500 → BRIGHT → LIGHT OFF'}",
+            "relay4": "ESP32 timer — independent",
+            "servo":  f"soil {soil_moisture} "
+                      f"{'> 2500 → 90° open' if rules['servo'] == 90 else '<= 2500 → 0° closed'}"
         },
-        "model_used":       "ml" if has_model else "rule_fallback",
-        "model_trained_on": f"{trained_on} rows"
+        "model_used":   "ml" if has_model else "rule_fallback",
+        "trained_on":   f"{trained_on} rows",
+        "accuracy":     f"{accuracy}%" if accuracy else "pending"
     })
 
 @app.route("/demo")
 def demo():
+    """Insert one random row — for testing without ESP32."""
     import random
     temperature   = round(random.uniform(20, 35), 2)
     humidity      = round(random.uniform(40, 80), 2)
     ldr_value     = random.randint(0, 4095)
     soil_moisture = random.randint(1000, 4000)
-    distance      = round(random.uniform(2, 30), 2)
+    distance      = round(random.uniform(2, 40), 2)
+    servo_angle   = 90 if soil_moisture > SOIL_DRY_VAL else 0
     rules         = apply_rules(ldr_value, soil_moisture, distance)
-    ml_light      = predict_light(temperature, humidity, ldr_value,
-                                  soil_moisture, distance)
+    ml_light      = predict_light(temperature, humidity,
+                                  ldr_value, soil_moisture, distance)
+
     try:
         db     = get_db()
         cursor = db.cursor()
         cursor.execute("""
             INSERT INTO sensor_data
-            (temperature, humidity, ldr_value, soil_moisture, distance,
-             relay1_pump1, relay2_feeder, relay3_pump2, relay4_light)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (temperature, humidity, ldr_value, soil_moisture, distance,
-              rules["relay1"], 0, rules["relay3"], ml_light))
+            (temperature, humidity, ldr_value, soil_moisture,
+             distance, servo_angle,
+             relay1_pump1, relay2_pump2, relay3_light, relay4_feeder)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (temperature, humidity, ldr_value, soil_moisture,
+              distance, servo_angle,
+              rules["relay1"], rules["relay2"], ml_light, 0))
         db.commit()
         db.close()
     except MySQLError as e:
@@ -403,10 +446,11 @@ def demo():
         "ldr_value":     ldr_value,
         "soil_moisture": soil_moisture,
         "distance":      distance,
+        "servo_angle":   servo_angle,
         "relay1_pump1":  rules["relay1"],
-        "relay2_feeder": 0,
-        "relay3_pump2":  rules["relay3"],
-        "relay4_light":  ml_light
+        "relay2_pump2":  rules["relay2"],
+        "relay3_light":  ml_light,
+        "relay4_feeder": 0
     })
 
 @app.route("/latest")
@@ -442,7 +486,7 @@ def sensor_data():
     except MySQLError as e:
         return jsonify({"error": str(e)}), 500
 
-    return jsonify(ts_fix(rows))
+    return jsonify(fix_timestamps(rows))
 
 @app.route("/chart-data")
 def chart_data():
@@ -460,7 +504,7 @@ def chart_data():
     except MySQLError as e:
         return jsonify({"error": str(e)}), 500
 
-    return jsonify(ts_fix(rows))
+    return jsonify(fix_timestamps(rows))
 
 @app.route("/export/csv")
 def export_csv():
@@ -475,18 +519,21 @@ def export_csv():
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "timestamp", "temperature", "humidity",
-                     "ldr_value", "soil_moisture", "distance",
-                     "relay1_pump1", "relay2_feeder",
-                     "relay3_pump2", "relay4_light"])
+    writer.writerow([
+        "id", "timestamp", "temperature", "humidity",
+        "ldr_value", "soil_moisture", "distance", "servo_angle",
+        "relay1_pump1", "relay2_pump2", "relay3_light", "relay4_feeder"
+    ])
     for r in rows:
         ts = r["timestamp"]
         if isinstance(ts, datetime):
             ts = ts.strftime("%Y-%m-%d %H:%M:%S")
-        writer.writerow([r["id"], ts, r["temperature"], r["humidity"],
-                         r["ldr_value"], r["soil_moisture"], r["distance"],
-                         r["relay1_pump1"], r["relay2_feeder"],
-                         r["relay3_pump2"], r["relay4_light"]])
+        writer.writerow([
+            r["id"], ts, r["temperature"], r["humidity"],
+            r["ldr_value"], r["soil_moisture"], r["distance"], r["servo_angle"],
+            r["relay1_pump1"], r["relay2_pump2"],
+            r["relay3_light"], r["relay4_feeder"]
+        ])
 
     filename = f"smartfarm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return Response(
@@ -498,5 +545,5 @@ def export_csv():
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
-    log.info("Starting SmartFarm v2.0 on port %s", port)
+    log.info("SmartFarm v3.0 starting on port %s", port)
     app.run(host="0.0.0.0", port=port, debug=False)
