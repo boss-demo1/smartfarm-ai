@@ -1,4 +1,5 @@
 import os
+import random
 from datetime import datetime
 import pymysql
 from flask import Flask, request, jsonify
@@ -268,6 +269,60 @@ def get_sensor_data():
     finally:
         if 'connection' in locals():
             connection.close()
+# -----------------------------------------------------------------------------
+# NEW AUTOMATED DEMO DATA GENERATOR ROUTE
+# -----------------------------------------------------------------------------
+@app.route('/demo', methods=['GET'])
+def generate_demo_data():
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            # 1. Generate realistic, randomized smart farm sensor metrics
+            temperature = round(random.uniform(18.0, 38.0), 1)      # 18°C to 38°C
+            humidity = round(random.uniform(30.0, 85.0), 1)         # 30% to 85%
+            ldr_value = random.randint(100, 4095)                   # Spans above/below your 300 threshold
+            soil_moisture = random.randint(1000, 4500)              # Spans above/below your 2500 threshold
+            ultrasonic_distance = round(random.uniform(2.0, 20.0), 1) # 2cm to 20cm (crosses your 10cm threshold)
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # 2. Insert the randomized row into your live Railway database
+            sql = """
+                INSERT INTO sensor_data 
+                (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance) 
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance))
+            connection.commit()
+
+            # 3. Formulate the real-time hardware status simulation response
+            response = {
+                "status": "success",
+                "message": "Successfully generated and logged simulated sensor hardware metrics!",
+                "data_logged": {
+                    "timestamp": timestamp,
+                    "environmental_sensors": {
+                        "temperature_celsius": temperature,
+                        "humidity_percentage": humidity,
+                        "ldr_ambient_light": ldr_value,
+                        "soil_moisture_raw": soil_moisture,
+                        "ultrasonic_tank_distance_cm": ultrasonic_distance
+                    },
+                    "simulated_hardware_actions": {
+                        "pump1_tank_refill": "ON" if ultrasonic_distance > 10.0 else "OFF",
+                        "pump2_irrigation": "ON" if soil_moisture > 2500 else "OFF",
+                        "relay4_growth_light": "ON" if ldr_value <= 300 else "OFF",
+                        "servo_motor": "Active structural 20s interval cycle"
+                    }
+                }
+            }
+            return jsonify(response)
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        connection.close()
+
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
