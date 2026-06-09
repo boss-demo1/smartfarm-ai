@@ -9,9 +9,7 @@ import pandas as pd
 app = Flask(__name__)
 CORS(app)
 
-
-
-# ---> START ADDING HERE: Load the trained machine learning model binaries
+# Load the trained machine learning model binaries on startup
 try:
     irrigation_model = joblib.load('irrigation_model.pkl')
     irrigation_scaler = joblib.load('irrigation_scaler.pkl')
@@ -19,7 +17,6 @@ try:
     print("🚀 All ML Models and Scalers loaded successfully into memory!")
 except Exception as e:
     print(f"⚠️ Error loading ML model binaries: {e}")
-# ---> END OF INITIALIZATION BLOCK
 
 # Database connection helper
 def get_db_connection():
@@ -40,7 +37,6 @@ def get_plant_age_days():
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            # Query the exact sowing date value we created in Task 1.1
             sql = "SELECT setting_value FROM farm_settings WHERE setting_key = 'sowing_date'"
             cursor.execute(sql)
             result = cursor.fetchone()
@@ -55,7 +51,6 @@ def get_plant_age_days():
                 day_number = delta.total_seconds() / 86400.0
                 return max(0.0, day_number) # Prevent negative numbers
             else:
-                # Fallback backup default if table row gets deleted
                 return 0.0
     except Exception as e:
         print(f"Error reading dynamic farm_settings: {e}")
@@ -64,10 +59,8 @@ def get_plant_age_days():
         connection.close()
 
 # -----------------------------------------------------------------------------
-# UPDATED PREDICT ENDPOINT PIPELINE EXAMPLE
+# MACHINE LEARNING ENGINE FEATURE CALCULATOR
 # -----------------------------------------------------------------------------
-# ---> REPLACE EVERYTHING FROM HERE DOWN TO 'if __name__ == "__main__":'
-
 def calculate_live_metrics():
     """
     Queries history from the database to compute real-time cumulative features
@@ -123,7 +116,9 @@ def calculate_live_metrics():
     finally:
         connection.close()
 
-
+# -----------------------------------------------------------------------------
+# PRODUCTION PREDICT ENDPOINT PIPELINE
+# -----------------------------------------------------------------------------
 @app.route('/predict', methods=['GET'])
 def predict():
     try:
@@ -180,7 +175,48 @@ def predict():
     except Exception as err:
         return jsonify({"error": str(err), "details": "Verify your model .pkl binaries exist in the root folder"}), 500
 
-# ---> STOP REPLACING HERE
+# -----------------------------------------------------------------------------
+# RESTORED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
+# -----------------------------------------------------------------------------
+@app.route('/latest', methods=['GET'])
+def get_latest():
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT * FROM sensor_data ORDER BY timestamp DESC LIMIT 1"
+            cursor.execute(sql)
+            result = cursor.fetchone()
+            if result:
+                if 'timestamp' in result and isinstance(result['timestamp'], datetime):
+                    result['timestamp'] = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                return jsonify(result)
+            return jsonify({"error": "No sensor data logs found in database"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        connection.close()
+
+# -----------------------------------------------------------------------------
+# RESTORED ROUTE 2: Fetch historical records for telemetry charts (e.g., limit=50)
+# -----------------------------------------------------------------------------
+@app.route('/sensor-data', methods=['GET'])
+def get_sensor_data():
+    limit = request.args.get('limit', default=50, type=int)
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT * FROM sensor_data ORDER BY timestamp DESC LIMIT %s"
+            cursor.execute(sql, (limit,))
+            results = cursor.fetchall()
+            
+            for row in results:
+                if 'timestamp' in row and isinstance(row['timestamp'], datetime):
+                    row['timestamp'] = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        connection.close()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
