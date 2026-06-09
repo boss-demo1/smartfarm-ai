@@ -30,46 +30,81 @@ def get_db_connection():
     )
 
 # -----------------------------------------------------------------------------
+# NEW DIAGNOSTIC HEALTH ROUTE (Addresses your /health link request)
+# -----------------------------------------------------------------------------
+@app.route('/health', methods=['GET'])
+def health_check():
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "database_connected": False,
+        "models_loaded": False,
+        "error_logs": None
+    }
+    
+    # 1. Verify Machine Learning Binaries
+    if 'irrigation_model' in globals() and 'yield_model' in globals():
+        health_status["models_loaded"] = True
+        
+    # 2. Verify Database Connection
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        connection.close()
+        health_status["database_connected"] = True
+    except Exception as e:
+        health_status["status"] = "unhealthy"
+        health_status["error_logs"] = f"Database connection failed: {str(e)}"
+        
+    return jsonify(health_status)
+
+# -----------------------------------------------------------------------------
 # PHASE 1, TASK 1.2: DYNAMIC LOGIC FOR SOWING DATE & PLANT AGE
 # -----------------------------------------------------------------------------
 def get_plant_age_days():
     """Queries farm_settings to compute how many days the crop has been alive."""
-    connection = get_db_connection()
     try:
+        connection = get_db_connection()
         with connection.cursor() as cursor:
+            # Check if table exists first before running query
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.tables 
+                WHERE table_schema = DATABASE() AND table_name = 'farm_settings'
+            """)
+            if cursor.fetchone()['COUNT(*)'] == 0:
+                return 0.0
+
             sql = "SELECT setting_value FROM farm_settings WHERE setting_key = 'sowing_date'"
             cursor.execute(sql)
             result = cursor.fetchone()
             
             if result:
-                sowing_date_str = result['setting_value']  # '2026-05-22'
+                sowing_date_str = result['setting_value']
                 sowing_date = datetime.strptime(sowing_date_str, '%Y-%m-%d')
                 current_date = datetime.now()
-                
-                # Calculate the exact difference in total decimal days
                 delta = current_date - sowing_date
-                day_number = delta.total_seconds() / 86400.0
-                return max(0.0, day_number) # Prevent negative numbers
-            else:
-                return 0.0
+                return max(0.0, delta.total_seconds() / 86400.0)
+            return 0.0
     except Exception as e:
         print(f"Error reading dynamic farm_settings: {e}")
         return 0.0
     finally:
-        connection.close()
+        if 'connection' in locals():
+            connection.close()
 
 # -----------------------------------------------------------------------------
 # MACHINE LEARNING ENGINE FEATURE CALCULATOR
 # -----------------------------------------------------------------------------
 def calculate_live_metrics():
-    """
-    Queries history from the database to compute real-time cumulative features
-    based on the actual sowing date.
-    """
-    connection = get_db_connection()
     try:
+        connection = get_db_connection()
         with connection.cursor() as cursor:
-            # 1. Fetch Sowing Date
+            # Check if tables exist
+            cursor.execute("SHOW TABLES LIKE 'farm_settings'")
+            if not cursor.fetchone():
+                return 0.0, 0.0, 0.0, 0.0
+                
             cursor.execute("SELECT setting_value FROM farm_settings WHERE setting_key = 'sowing_date'")
             sowing_res = cursor.fetchone()
             if not sowing_res:
@@ -77,23 +112,21 @@ def calculate_live_metrics():
             
             sowing_date = datetime.strptime(sowing_res['setting_value'], '%Y-%m-%d')
             current_time = datetime.now()
-            
-            # Calculate fractional day number
             day_number = max(0.0, (current_time - sowing_date).total_seconds() / 86400.0)
             
-            # 2. Fetch recent sensor logs to build cumulative approximations
+            cursor.execute("SHOW TABLES LIKE 'sensor_data'")
+            if not cursor.fetchone():
+                return day_number, day_number * 12.5, 0.0, day_number * 15.0
+
             cursor.execute("SELECT timestamp, temperature, soil_moisture FROM sensor_data ORDER BY timestamp ASC")
             logs = cursor.fetchall()
             
             if not logs:
-                # Fallback default values based on age if table is clear
                 approx_gdd = day_number * 12.5
                 return day_number, approx_gdd, 0.0, day_number * 15.0
             
             df = pd.DataFrame(logs)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            # Simple aggregations
             df['date_only'] = df['timestamp'].dt.date
             daily_groups = df.groupby('date_only')
             
@@ -103,7 +136,6 @@ def calculate_live_metrics():
                 gdd_today = max(0.0, daily_avg - 10.0)
                 cumulative_gdd += gdd_today
                 
-            # Time differences for stress and water integrals
             df['time_delta_hours'] = df['timestamp'].diff().dt.total_seconds().fillna(15.0) / 3600.0
             cumulative_heat_stress = (df.loc[df['temperature'] > 30.0, 'time_delta_hours'].sum())
             cumulative_water = ((4095 - df['soil_moisture']) * df['time_delta_hours']).sum() / 1000.0
@@ -114,7 +146,8 @@ def calculate_live_metrics():
         print(f"Error calculating live cumulative features: {e}")
         return 0.0, 0.0, 0.0, 0.0
     finally:
-        connection.close()
+        if 'connection' in locals():
+            connection.close()
 
 # -----------------------------------------------------------------------------
 # PRODUCTION PREDICT ENDPOINT PIPELINE
@@ -122,27 +155,22 @@ def calculate_live_metrics():
 @app.route('/predict', methods=['GET'])
 def predict():
     try:
-        # Get live sensor arguments from request parameters
         temp = float(request.args.get('temperature', 25.0))
         hum = float(request.args.get('humidity', 50.0))
         ldr = int(request.args.get('ldr_value', 2000))
         soil = int(request.args.get('soil_moisture', 2000))
         
-        # Pull our timeline parameters and cumulative sums
         day_number, cum_gdd, heat_stress, cum_water = calculate_live_metrics()
         
-        # 1. Compute Active Irrigation Duration Prediction
         input_data_irr = [[temp, hum, soil, day_number]]
         scaled_features_irr = irrigation_scaler.transform(input_data_irr)
         predicted_duration = irrigation_model.predict(scaled_features_irr)[0]
         
-        # 2. Compute Yield Forecast Prediction
         input_data_yield = [[day_number, cum_gdd, heat_stress, cum_water]]
         yield_preds = yield_model.predict(input_data_yield)[0]
         predicted_grams = yield_preds[0]
         predicted_pods = int(yield_preds[1])
         
-        # Classify the biological development growth stage window
         if day_number <= 15:
             growth_stage = "Germination / Emergence"
         elif day_number <= 45:
@@ -154,7 +182,6 @@ def predict():
 
         light_decision = 1 if ldr > 3000 else 0
 
-        # Construct JSON output array to match index.html properties exactly
         response_data = {
             "actuator_predictions": {
                 "relay2_predicted_duration_seconds": max(0.0, float(predicted_duration)),
@@ -169,69 +196,65 @@ def predict():
                 "expected_yield_pods": max(0, predicted_pods)
             }
         }
-        
         return jsonify(response_data)
-        
     except Exception as err:
-        return jsonify({"error": str(err), "details": "Verify your model .pkl binaries exist in the root folder"}), 500
+        return jsonify({"error": str(err)}), 500
+
 # -----------------------------------------------------------------------------
-# FIXED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
+# RESTORED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
 # -----------------------------------------------------------------------------
 @app.route('/latest', methods=['GET'])
 def get_latest():
-    connection = get_db_connection()
     try:
+        connection = get_db_connection()
         with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'sensor_data'")
+            if not cursor.fetchone():
+                return jsonify({"error": "Table 'sensor_data' does not exist"}), 200
+
             sql = "SELECT * FROM sensor_data ORDER BY timestamp DESC LIMIT 1"
             cursor.execute(sql)
             result = cursor.fetchone()
             
-            if result:
-                # Handle both Dictionary cursors and standard Tuple cursors safely
-                if isinstance(result, dict):
-                    if 'timestamp' in result and result['timestamp'] is not None:
-                        # Use internal string conversion if it's a datetime object
-                        if hasattr(result['timestamp'], 'strftime'):
-                            result['timestamp'] = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                        else:
-                            result['timestamp'] = str(result['timestamp'])
-                    return jsonify(result)
-                else:
-                    # Fallback if cursor defaults to raw tuples
-                    return jsonify(list(result))
-                    
-            return jsonify({"error": "No sensor data logs found in database"}), 404
+            if result and isinstance(result, dict):
+                if 'timestamp' in result and hasattr(result['timestamp'], 'strftime'):
+                    result['timestamp'] = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                return jsonify(result)
+            return jsonify({"status": "waiting for logs", "message": "No sensor rows found"}), 200
     except Exception as e:
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+        return jsonify({"error": "DB Processing Error", "details": str(e)}), 500
     finally:
-        connection.close()
+        if 'connection' in locals():
+            connection.close()
 
 # -----------------------------------------------------------------------------
-# FIXED ROUTE 2: Fetch historical records for telemetry charts (e.g., limit=50)
+# RESTORED ROUTE 2: Fetch historical records for telemetry charts (e.g., limit=50)
 # -----------------------------------------------------------------------------
 @app.route('/sensor-data', methods=['GET'])
 def get_sensor_data():
     limit = request.args.get('limit', default=50, type=int)
-    connection = get_db_connection()
     try:
+        connection = get_db_connection()
         with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'sensor_data'")
+            if not cursor.fetchone():
+                return jsonify([])
+
             sql = "SELECT * FROM sensor_data ORDER BY timestamp DESC LIMIT %s"
             cursor.execute(sql, (limit,))
             results = cursor.fetchall()
             
-            # Formulate robust format handling for multiple rows
             if results:
                 for row in results:
-                    if isinstance(row, dict) and 'timestamp' in row and row['timestamp'] is not None:
-                        if hasattr(row['timestamp'], 'strftime'):
-                            row['timestamp'] = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                        else:
-                            row['timestamp'] = str(row['timestamp'])
+                    if isinstance(row, dict) and 'timestamp' in row and hasattr(row['timestamp'], 'strftime'):
+                        row['timestamp'] = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
                 return jsonify(results)
-            return jsonify([]) # Return clean empty array if table has no rows yet
+            return jsonify([])
     except Exception as e:
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+        return jsonify({"error": "DB Processing Error", "details": str(e)}), 500
     finally:
-        connection.close()
+        if 'connection' in locals():
+            connection.close()
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
