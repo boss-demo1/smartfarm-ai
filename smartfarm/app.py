@@ -21,11 +21,11 @@ except Exception as e:
 # Database connection helper
 def get_db_connection():
     return pymysql.connect(
-        host=os.getenv('MYSQLHOST', 'mysql.railway.internal'),
+        host=os.getenv('MYSQLHOST', 'centerbeam.proxy.rlwy.net'),
         user=os.getenv('MYSQLUSER', 'root'),
         password=os.getenv('MYSQLPASSWORD', 'rQjNEHvAHmbqgFfnvRZnZRpPcEnBctqd'),
         database=os.getenv('MYSQLDATABASE', 'railway'),
-        port=int(os.getenv('MYSQLPORT', 3306)),
+        port=int(os.getenv('MYSQLPORT', 18813)),
         cursorclass=pymysql.cursors.DictCursor
     )
 
