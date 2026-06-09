@@ -155,51 +155,64 @@ def calculate_live_metrics():
 @app.route('/predict', methods=['GET'])
 def predict():
     try:
+        # 1. Capture your exact hardware sensor readings from incoming request arguments
         temp = float(request.args.get('temperature', 25.0))
         hum = float(request.args.get('humidity', 50.0))
         ldr = int(request.args.get('ldr_value', 2000))
         soil = int(request.args.get('soil_moisture', 2000))
+        ultrasonic = float(request.args.get('ultrasonic_distance', 5.0)) # default 5cm (full)
         
+        # Pull timeline parameters and cumulative weather history summaries
         day_number, cum_gdd, heat_stress, cum_water = calculate_live_metrics()
         
+        # 2. Machine Learning Pipeline: Adjusting for Evaporation & Crop Timeline
         input_data_irr = [[temp, hum, soil, day_number]]
         scaled_features_irr = irrigation_scaler.transform(input_data_irr)
-        predicted_duration = irrigation_model.predict(scaled_features_irr)[0]
+        ml_predicted_duration = float(irrigation_model.predict(scaled_features_irr)[0])
         
+        # 3. Apply your explicit rule-based override logic
+        pump1_status = 1 if ultrasonic > 10.0 else 0
+        pump2_status = 1 if soil > 2500 else 0
+        relay4_light = 1 if ldr <= 300 else 0
+        
+        # Yield Forecasting ML calculations
         input_data_yield = [[day_number, cum_gdd, heat_stress, cum_water]]
         yield_preds = yield_model.predict(input_data_yield)[0]
-        predicted_grams = yield_preds[0]
-        predicted_pods = int(yield_preds[1])
         
         if day_number <= 15:
             growth_stage = "Germination / Emergence"
         elif day_number <= 45:
             growth_stage = "Vegetative Development"
-        elif day_number <= 75:
-            growth_stage = "Flowering & Pod Setting"
         else:
-            growth_stage = "Maturation / Senescence"
+            growth_stage = "Flowering / Maturation"
 
-        light_decision = 1 if ldr > 3000 else 0
-
+        # 4. Construct response payload matching your exact hardware map
         response_data = {
-            "actuator_predictions": {
-                "relay2_predicted_duration_seconds": max(0.0, float(predicted_duration)),
-                "relay3_growth_light": light_decision
+            "sensor_snapshots": {
+                "temperature": temp,
+                "humidity": hum,
+                "soil_moisture": soil,
+                "ldr_value": ldr,
+                "ultrasonic_distance_cm": ultrasonic
+            },
+            "actuator_states": {
+                "pump1_tank_refill": pump1_status,
+                "pump2_irrigation_pump": pump2_status,
+                "pump2_ml_recommended_duration_seconds": max(0.0, round(ml_predicted_duration, 1)),
+                "relay4_growth_light": relay4_light,
+                "servo_schedule": "Every 20s rotate 0 to 180 for 3s"
             },
             "agronomic_yield_forecast": {
                 "current_growth_stage": growth_stage,
                 "accumulated_gdd": round(cum_gdd, 1),
-                "estimated_harvest_date": "2026-09-10", 
-                "projected_days_until_harvest": max(0, int(110 - day_number)),
-                "expected_yield_grams": round(max(0.0, predicted_grams), 1),
-                "expected_yield_pods": max(0, predicted_pods)
+                "expected_yield_grams": round(max(0.0, yield_preds[0]), 1),
+                "projected_days_until_harvest": max(0, int(110 - day_number))
             }
         }
         return jsonify(response_data)
+        
     except Exception as err:
         return jsonify({"error": str(err)}), 500
-
 # -----------------------------------------------------------------------------
 # RESTORED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
 # -----------------------------------------------------------------------------
