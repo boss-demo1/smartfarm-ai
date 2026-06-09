@@ -174,9 +174,8 @@ def predict():
         
     except Exception as err:
         return jsonify({"error": str(err), "details": "Verify your model .pkl binaries exist in the root folder"}), 500
-
 # -----------------------------------------------------------------------------
-# RESTORED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
+# FIXED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
 # -----------------------------------------------------------------------------
 @app.route('/latest', methods=['GET'])
 def get_latest():
@@ -186,18 +185,29 @@ def get_latest():
             sql = "SELECT * FROM sensor_data ORDER BY timestamp DESC LIMIT 1"
             cursor.execute(sql)
             result = cursor.fetchone()
+            
             if result:
-                if 'timestamp' in result and isinstance(result['timestamp'], datetime):
-                    result['timestamp'] = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                return jsonify(result)
+                # Handle both Dictionary cursors and standard Tuple cursors safely
+                if isinstance(result, dict):
+                    if 'timestamp' in result and result['timestamp'] is not None:
+                        # Use internal string conversion if it's a datetime object
+                        if hasattr(result['timestamp'], 'strftime'):
+                            result['timestamp'] = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            result['timestamp'] = str(result['timestamp'])
+                    return jsonify(result)
+                else:
+                    # Fallback if cursor defaults to raw tuples
+                    return jsonify(list(result))
+                    
             return jsonify({"error": "No sensor data logs found in database"}), 404
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
     finally:
         connection.close()
 
 # -----------------------------------------------------------------------------
-# RESTORED ROUTE 2: Fetch historical records for telemetry charts (e.g., limit=50)
+# FIXED ROUTE 2: Fetch historical records for telemetry charts (e.g., limit=50)
 # -----------------------------------------------------------------------------
 @app.route('/sensor-data', methods=['GET'])
 def get_sensor_data():
@@ -209,14 +219,19 @@ def get_sensor_data():
             cursor.execute(sql, (limit,))
             results = cursor.fetchall()
             
-            for row in results:
-                if 'timestamp' in row and isinstance(row['timestamp'], datetime):
-                    row['timestamp'] = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-            return jsonify(results)
+            # Formulate robust format handling for multiple rows
+            if results:
+                for row in results:
+                    if isinstance(row, dict) and 'timestamp' in row and row['timestamp'] is not None:
+                        if hasattr(row['timestamp'], 'strftime'):
+                            row['timestamp'] = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            row['timestamp'] = str(row['timestamp'])
+                return jsonify(results)
+            return jsonify([]) # Return clean empty array if table has no rows yet
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
     finally:
         connection.close()
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
