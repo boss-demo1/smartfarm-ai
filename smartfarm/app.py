@@ -284,7 +284,7 @@ def generate_demo_data():
             temperature = 22.0
             humidity = 65.0
             ldr_value = 1500
-            soil_moisture = 1800  // Nicely watered initially
+            soil_moisture = 1800  # Nicely watered initially
             ultrasonic_distance = 5.0
             
             current_time = datetime.now()
