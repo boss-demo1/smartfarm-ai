@@ -6,4 +6,4 @@ numpy
 scikit-learn
 joblib
 gunicorn
-EOF
+
