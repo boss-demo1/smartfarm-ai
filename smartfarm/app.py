@@ -31,7 +31,7 @@ def get_db_connection():
     )
 
 # -----------------------------------------------------------------------------
-# NEW DIAGNOSTIC HEALTH ROUTE (Addresses your /health link request)
+# DIAGNOSTIC HEALTH ROUTE
 # -----------------------------------------------------------------------------
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -43,11 +43,9 @@ def health_check():
         "error_logs": None
     }
     
-    # 1. Verify Machine Learning Binaries
     if 'irrigation_model' in globals() and 'yield_model' in globals():
         health_status["models_loaded"] = True
         
-    # 2. Verify Database Connection
     try:
         connection = get_db_connection()
         with connection.cursor() as cursor:
@@ -61,14 +59,13 @@ def health_check():
     return jsonify(health_status)
 
 # -----------------------------------------------------------------------------
-# PHASE 1, TASK 1.2: DYNAMIC LOGIC FOR SOWING DATE & PLANT AGE
+# DYNAMIC LOGIC FOR SOWING DATE & PLANT AGE
 # -----------------------------------------------------------------------------
 def get_plant_age_days():
     """Queries farm_settings to compute how many days the crop has been alive."""
     try:
         connection = get_db_connection()
         with connection.cursor() as cursor:
-            # Check if table exists first before running query
             cursor.execute("""
                 SELECT COUNT(*) FROM information_schema.tables 
                 WHERE table_schema = DATABASE() AND table_name = 'farm_settings'
@@ -101,7 +98,6 @@ def calculate_live_metrics():
     try:
         connection = get_db_connection()
         with connection.cursor() as cursor:
-            # Check if tables exist
             cursor.execute("SHOW TABLES LIKE 'farm_settings'")
             if not cursor.fetchone():
                 return 0.0, 0.0, 0.0, 0.0
@@ -156,12 +152,12 @@ def calculate_live_metrics():
 @app.route('/predict', methods=['GET'])
 def predict():
     try:
-        # 1. Capture your exact hardware sensor readings from incoming request arguments
+        # 1. Capture exact hardware sensor readings from incoming request arguments
         temp = float(request.args.get('temperature', 25.0))
         hum = float(request.args.get('humidity', 50.0))
         ldr = int(request.args.get('ldr_value', 2000))
         soil = int(request.args.get('soil_moisture', 2000))
-        ultrasonic = float(request.args.get('ultrasonic_distance', 5.0)) # default 5cm (full)
+        ultrasonic = float(request.args.get('ultrasonic_distance', 5.0))
         
         # Pull timeline parameters and cumulative weather history summaries
         day_number, cum_gdd, heat_stress, cum_water = calculate_live_metrics()
@@ -171,7 +167,7 @@ def predict():
         scaled_features_irr = irrigation_scaler.transform(input_data_irr)
         ml_predicted_duration = float(irrigation_model.predict(scaled_features_irr)[0])
         
-        # 3. Apply your explicit rule-based override logic
+        # 3. Apply rule-based override logic
         pump1_status = 1 if ultrasonic > 10.0 else 0
         pump2_status = 1 if soil > 2500 else 0
         relay4_light = 1 if ldr <= 300 else 0
@@ -187,7 +183,25 @@ def predict():
         else:
             growth_stage = "Flowering / Maturation"
 
-        # 4. Construct response payload matching your exact hardware map
+        # 🚀 [ADDED RECORDING LAYER]: Save the incoming live log entry to the DB
+        try:
+            db_conn = get_db_connection()
+            with db_conn.cursor() as db_cursor:
+                insert_sql = """
+                    INSERT INTO sensor_data 
+                    (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance) 
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                db_cursor.execute(insert_sql, (
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    temp, hum, ldr, soil, ultrasonic
+                ))
+                db_conn.commit()
+            db_conn.close()
+        except Exception as db_err:
+            print(f"⚠️ Internal Telemetry Storage Warning: {db_err}")
+
+        # 4. Construct response payload matching hardware map
         response_data = {
             "sensor_snapshots": {
                 "temperature": temp,
@@ -206,7 +220,7 @@ def predict():
             "agronomic_yield_forecast": {
                 "current_growth_stage": growth_stage,
                 "accumulated_gdd": round(cum_gdd, 1),
-                "expected_yield_grams": round(max(0.0, yield_preds[0]), 1),
+                "expected_yield_grams": round(max(0.0, yield_preds), 1),
                 "projected_days_until_harvest": max(0, int(110 - day_number))
             }
         }
@@ -214,6 +228,7 @@ def predict():
         
     except Exception as err:
         return jsonify({"error": str(err)}), 500
+
 # -----------------------------------------------------------------------------
 # RESTORED ROUTE 1: Fetch the single latest sensor log entry for the dashboard
 # -----------------------------------------------------------------------------
@@ -242,7 +257,7 @@ def get_latest():
             connection.close()
 
 # -----------------------------------------------------------------------------
-# RESTORED ROUTE 2: Fetch historical records for telemetry charts (e.g., limit=50)
+# RESTORED ROUTE 2: Fetch historical records for telemetry charts
 # -----------------------------------------------------------------------------
 @app.route('/sensor-data', methods=['GET'])
 def get_sensor_data():
@@ -269,6 +284,7 @@ def get_sensor_data():
     finally:
         if 'connection' in locals():
             connection.close()
+
 # -----------------------------------------------------------------------------
 # TWO-WEEK SEQUENTIAL CHRONOLOGICAL HISTORY GENERATOR
 # -----------------------------------------------------------------------------
@@ -277,64 +293,50 @@ def generate_demo_data():
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            # 1. Clear any transient test rows so the history is pristine
             cursor.execute("TRUNCATE TABLE sensor_data")
             
-            # Establish baseline starting parameters for the crop 14 days ago
             temperature = 22.0
             humidity = 65.0
             ldr_value = 1500
-            soil_moisture = 1800  # Nicely watered initially
+            soil_moisture = 1800 
             ultrasonic_distance = 5.0
             
             current_time = datetime.now()
             inserted_count = 0
             
-            # 2. Loop backwards 14 days, creating a record every 2 hours
-            # 14 days * 24 hours = 336 hours total / 2 hour steps = 168 records
             for hours_back in range(336, -1, -2):
                 record_timestamp = current_time - timedelta(hours=hours_back)
                 hour = record_timestamp.hour
                 
-                # --- Simulate Environmental Fluctuations (Day vs Night) ---
-                if 6 <= hour <= 15:  # Daytime warming (Sun rising)
+                if 6 <= hour <= 15: 
                     temperature += random.uniform(-0.2, 0.5)
                     humidity += random.uniform(-0.8, 0.2)
-                    ldr_value -= random.randint(80, 200) # Brighter ambient light
-                else:                # Nighttime cooling
+                    ldr_value -= random.randint(80, 200)
+                else: 
                     temperature += random.uniform(-0.5, 0.2)
                     humidity += random.uniform(-0.2, 0.8)
-                    ldr_value += random.randint(80, 200) # Darker
+                    ldr_value += random.randint(80, 200)
                 
-                # Safety limits for typical crop climates
                 temperature = max(17.0, min(36.0, temperature))
                 humidity = max(30.0, min(90.0, humidity))
                 ldr_value = max(150, min(4095, ldr_value))
                 
-                # --- Simulate Water Depletion & Automatic Actuation Loop ---
-                # Check if soil moisture crossed the threshold before this step
                 if soil_moisture >= 2500:
-                    # Pump 2 turned ON and irrigated perfectly (drops moisture back to wet)
                     soil_moisture = random.randint(1400, 1700)
                 else:
-                    # Water evaporates out. Faster evaporation if day is hot
                     evaporation_factor = 35 if temperature > 30.0 else 18
                     soil_moisture += random.randint(5, evaporation_factor)
                 
                 soil_moisture = max(500, min(3800, soil_moisture))
                 
-                # --- Simulate Ultrasonic Water Tank Level ---
                 if ultrasonic_distance > 15.0:
-                    # Pump 1 kicked in and filled the storage unit back up
                     ultrasonic_distance = 5.0
                 else:
-                    # Subtle drop in storage capacity
                     ultrasonic_distance += random.uniform(0.02, 0.1)
                 
                 ultrasonic_distance = round(max(2.0, ultrasonic_distance), 1)
                 formatted_ts = record_timestamp.strftime('%Y-%m-%d %H:%M:%S')
                 
-                # 3. Batch insert sequentially down the historical timeline
                 sql = """
                     INSERT INTO sensor_data 
                     (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance) 
@@ -363,4 +365,4 @@ def generate_demo_data():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000))) # Cleared trailing parenthesis error
