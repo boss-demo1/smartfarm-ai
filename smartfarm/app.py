@@ -270,58 +270,96 @@ def get_sensor_data():
         if 'connection' in locals():
             connection.close()
 # -----------------------------------------------------------------------------
-# NEW AUTOMATED DEMO DATA GENERATOR ROUTE
+# TWO-WEEK SEQUENTIAL CHRONOLOGICAL HISTORY GENERATOR
 # -----------------------------------------------------------------------------
 @app.route('/demo', methods=['GET'])
 def generate_demo_data():
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            # 1. Generate realistic, randomized smart farm sensor metrics
-            temperature = round(random.uniform(18.0, 38.0), 1)      # 18°C to 38°C
-            humidity = round(random.uniform(30.0, 85.0), 1)         # 30% to 85%
-            ldr_value = random.randint(100, 4095)                   # Spans above/below your 300 threshold
-            soil_moisture = random.randint(1000, 4500)              # Spans above/below your 2500 threshold
-            ultrasonic_distance = round(random.uniform(2.0, 20.0), 1) # 2cm to 20cm (crosses your 10cm threshold)
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            # 2. Insert the randomized row into your live Railway database
-            sql = """
-                INSERT INTO sensor_data 
-                (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance) 
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(sql, (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance))
+            # 1. Clear any transient test rows so the history is pristine
+            cursor.execute("TRUNCATE TABLE sensor_data")
+            
+            # Establish baseline starting parameters for the crop 14 days ago
+            temperature = 22.0
+            humidity = 65.0
+            ldr_value = 1500
+            soil_moisture = 1800  // Nicely watered initially
+            ultrasonic_distance = 5.0
+            
+            current_time = datetime.now()
+            inserted_count = 0
+            
+            # 2. Loop backwards 14 days, creating a record every 2 hours
+            # 14 days * 24 hours = 336 hours total / 2 hour steps = 168 records
+            for hours_back in range(336, -1, -2):
+                record_timestamp = current_time - timedelta(hours=hours_back)
+                hour = record_timestamp.hour
+                
+                # --- Simulate Environmental Fluctuations (Day vs Night) ---
+                if 6 <= hour <= 15:  # Daytime warming (Sun rising)
+                    temperature += random.uniform(-0.2, 0.5)
+                    humidity += random.uniform(-0.8, 0.2)
+                    ldr_value -= random.randint(80, 200) # Brighter ambient light
+                else:                # Nighttime cooling
+                    temperature += random.uniform(-0.5, 0.2)
+                    humidity += random.uniform(-0.2, 0.8)
+                    ldr_value += random.randint(80, 200) # Darker
+                
+                # Safety limits for typical crop climates
+                temperature = max(17.0, min(36.0, temperature))
+                humidity = max(30.0, min(90.0, humidity))
+                ldr_value = max(150, min(4095, ldr_value))
+                
+                # --- Simulate Water Depletion & Automatic Actuation Loop ---
+                # Check if soil moisture crossed the threshold before this step
+                if soil_moisture >= 2500:
+                    # Pump 2 turned ON and irrigated perfectly (drops moisture back to wet)
+                    soil_moisture = random.randint(1400, 1700)
+                else:
+                    # Water evaporates out. Faster evaporation if day is hot
+                    evaporation_factor = 35 if temperature > 30.0 else 18
+                    soil_moisture += random.randint(5, evaporation_factor)
+                
+                soil_moisture = max(500, min(3800, soil_moisture))
+                
+                # --- Simulate Ultrasonic Water Tank Level ---
+                if ultrasonic_distance > 15.0:
+                    # Pump 1 kicked in and filled the storage unit back up
+                    ultrasonic_distance = 5.0
+                else:
+                    # Subtle drop in storage capacity
+                    ultrasonic_distance += random.uniform(0.02, 0.1)
+                
+                ultrasonic_distance = round(max(2.0, ultrasonic_distance), 1)
+                formatted_ts = record_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # 3. Batch insert sequentially down the historical timeline
+                sql = """
+                    INSERT INTO sensor_data 
+                    (timestamp, temperature, humidity, ldr_value, soil_moisture, ultrasonic_distance) 
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(sql, (formatted_ts, round(temperature, 1), round(humidity, 1), 
+                                     int(ldr_value), int(soil_moisture), ultrasonic_distance))
+                inserted_count += 1
+                
             connection.commit()
-
-            # 3. Formulate the real-time hardware status simulation response
-            response = {
+            
+            return jsonify({
                 "status": "success",
-                "message": "Successfully generated and logged simulated sensor hardware metrics!",
-                "data_logged": {
-                    "timestamp": timestamp,
-                    "environmental_sensors": {
-                        "temperature_celsius": temperature,
-                        "humidity_percentage": humidity,
-                        "ldr_ambient_light": ldr_value,
-                        "soil_moisture_raw": soil_moisture,
-                        "ultrasonic_tank_distance_cm": ultrasonic_distance
-                    },
-                    "simulated_hardware_actions": {
-                        "pump1_tank_refill": "ON" if ultrasonic_distance > 10.0 else "OFF",
-                        "pump2_irrigation": "ON" if soil_moisture > 2500 else "OFF",
-                        "relay4_growth_light": "ON" if ldr_value <= 300 else "OFF",
-                        "servo_motor": "Active structural 20s interval cycle"
-                    }
+                "message": f"Successfully generated a robust 14-day historical matrix for your crop!",
+                "total_records_inserted": inserted_count,
+                "timeline_range": {
+                    "start": (current_time - timedelta(days=14)).strftime('%Y-%m-%d %H:%M:%S'),
+                    "end": current_time.strftime('%Y-%m-%d %H:%M:%S')
                 }
-            }
-            return jsonify(response)
-
+            })
+            
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         connection.close()
-
 
 
 if __name__ == '__main__':
