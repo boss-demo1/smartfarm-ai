@@ -83,24 +83,24 @@ model_state = {
 try:
     model_state["model"] = joblib.load(MODEL_PATH)
     log.info("Light ML model loaded -> %s", MODEL_PATH)
-except FileNotFoundError:
+except Exception:
     log.warning("No light model found — rule fallback active until first retrain")
 
 try:
     irrigation_model  = joblib.load(IRRIGATION_MODEL_PATH)
     irrigation_scaler = joblib.load(IRRIGATION_SCALER_PATH)
     log.info("Irrigation model loaded")
-except FileNotFoundError:
+except Exception:
     irrigation_model = irrigation_scaler = None
-    log.warning("Irrigation model not found — will train on startup")
+    log.warning("Irrigation model could not be loaded — will train on startup")
 
 try:
     yield_model  = joblib.load(YIELD_MODEL_PATH)
     yield_scaler = joblib.load(YIELD_SCALER_PATH)
     log.info("Yield model loaded")
-except FileNotFoundError:
+except Exception:
     yield_model = yield_scaler = None
-    log.warning("Yield model not found — will train on startup")
+    log.warning("Yield model could not be loaded — will train on startup")
 
 # ── Database ──────────────────────────────────────────────────
 def get_db():
