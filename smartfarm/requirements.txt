@@ -1,7 +1,9 @@
-Flask
-Flask-CORS
-pymysql
+flask
+flask-cors
+mysql-connector-python
 pandas
-joblib
+numpy
 scikit-learn
+joblib
 gunicorn
+EOF
