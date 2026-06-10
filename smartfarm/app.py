@@ -91,9 +91,6 @@ def get_plant_age_days():
         if 'connection' in locals():
             connection.close()
 
-# -----------------------------------------------------------------------------
-# MACHINE LEARNING ENGINE FEATURE CALCULATOR
-# -----------------------------------------------------------------------------
 def calculate_live_metrics():
     try:
         connection = get_db_connection()
@@ -123,19 +120,31 @@ def calculate_live_metrics():
                 return day_number, approx_gdd, 0.0, day_number * 15.0
             
             df = pd.DataFrame(logs)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            
+            # Drop any rows where timestamp interpretation fails completely
+            df = df.dropna(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+            if df.empty:
+                return day_number, day_number * 12.5, 0.0, day_number * 15.0
+
             df['date_only'] = df['timestamp'].dt.date
             daily_groups = df.groupby('date_only')
             
             cumulative_gdd = 0.0
             for date_item, group in daily_groups:
-                daily_avg = (group['temperature'].max() + group['temperature'].min()) / 2.0
-                gdd_today = max(0.0, daily_avg - 10.0)
-                cumulative_gdd += gdd_today
+                if not group.empty:
+                    daily_avg = (group['temperature'].max() + group['temperature'].min()) / 2.0
+                    gdd_today = max(0.0, daily_avg - 10.0)
+                    cumulative_gdd += gdd_today
                 
-            df['time_delta_hours'] = df['timestamp'].diff().dt.total_seconds().fillna(15.0) / 3600.0
-            cumulative_heat_stress = (df.loc[df['temperature'] > 30.0, 'time_delta_hours'].sum())
-            cumulative_water = ((4095 - df['soil_moisture']) * df['time_delta_hours']).sum() / 1000.0
+            # Safely calculate time variations between logging intervals
+            df['time_delta_hours'] = df['timestamp'].diff().dt.total_seconds().fillna(0.0) / 3600.0
+            # If the gap calculation produces negative anomalies or outliers, normalize it to standard step size
+            df.loc[df['time_delta_hours'] < 0, 'time_delta_hours'] = 0.0
+            df.loc[df['time_delta_hours'] > 12, 'time_delta_hours'] = 2.0
+            
+            cumulative_heat_stress = float(df.loc[df['temperature'] > 30.0, 'time_delta_hours'].sum())
+            cumulative_water = float(((4095 - df['soil_moisture']) * df['time_delta_hours']).sum() / 1000.0)
             
             return day_number, cumulative_gdd, cumulative_heat_stress, cumulative_water
             
